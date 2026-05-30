@@ -221,6 +221,19 @@ async def my_channels(message: types.Message):
         await message.answer("У тебя пока нет добавленных каналов.")
         return
 
+    kb = await _build_channels_keyboard(message.from_user.id)
+    await message.answer(
+        "Твои каналы. Нажми на канал, чтобы включить/выключить, ❌ чтобы удалить.",
+        reply_markup=kb.as_markup(),
+    )
+
+
+async def _build_channels_keyboard(user_id: int) -> InlineKeyboardBuilder:
+    async with async_session() as session:
+        result = await session.execute(
+            select(Channel).where(Channel.user_id == user_id)
+        )
+        channels = result.scalars().all()
     kb = InlineKeyboardBuilder()
     for ch in channels:
         status = "✅" if ch.is_active else "⏸️"
@@ -229,16 +242,9 @@ async def my_channels(message: types.Message):
                 text=f"{status} {ch.channel_title or ch.channel_username}",
                 callback_data=f"ch_toggle:{ch.id}",
             ),
-            InlineKeyboardButton(
-                text="❌",
-                callback_data=f"ch_delete:{ch.id}",
-            ),
+            InlineKeyboardButton(text="❌", callback_data=f"ch_delete:{ch.id}"),
         )
-
-    await message.answer(
-        "Твои каналы. Нажми на канал, чтобы включить/выключить, ❌ чтобы удалить.",
-        reply_markup=kb.as_markup(),
-    )
+    return kb
 
 
 @router.callback_query(F.data.startswith("ch_toggle:"))
@@ -257,7 +263,8 @@ async def toggle_channel(callback: types.CallbackQuery):
         else:
             await callback.answer("Канал не найден.")
 
-    await callback.message.edit_reply_markup(reply_markup=callback.message.reply_markup)
+    kb = await _build_channels_keyboard(callback.from_user.id)
+    await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
 
 
 @router.callback_query(F.data.startswith("ch_delete:"))
@@ -275,27 +282,10 @@ async def delete_channel(callback: types.CallbackQuery):
         else:
             await callback.answer("Канал не найден.")
 
-    # Rebuild keyboard without the deleted channel
-    async with async_session() as session:
-        result = await session.execute(
-            select(Channel).where(Channel.user_id == callback.from_user.id)
-        )
-        channels = result.scalars().all()
-
-    kb = InlineKeyboardBuilder()
-    for ch in channels:
-        status = "✅" if ch.is_active else "⏸️"
-        kb.row(
-            InlineKeyboardButton(
-                text=f"{status} {ch.channel_title or ch.channel_username}",
-                callback_data=f"ch_toggle:{ch.id}",
-            ),
-            InlineKeyboardButton(text="❌", callback_data=f"ch_delete:{ch.id}"),
-        )
-
-    if channels:
+    kb = await _build_channels_keyboard(callback.from_user.id)
+    try:
         await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
-    else:
+    except Exception:
         await callback.message.edit_text("У тебя пока нет добавленных каналов.")
 
 
