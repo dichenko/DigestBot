@@ -304,7 +304,7 @@ async def status(message: types.Message):
         f"Ошибок: {len(failed)}\n"
         f"Порог: {user.score_threshold}/100\n"
     )
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text)
 
 
 # --- Settings ---
@@ -316,14 +316,14 @@ async def settings(message: types.Message):
         return
     user = await _ensure_user(message.from_user.id)
     text = (
-        f"⚙️ **Настройки**\n\n"
+        f"⚙️ Настройки\n\n"
         f"Порог отправки: {user.score_threshold}/100\n"
         f"Часовой пояс: {user.timezone}\n\n"
         f"/threshold 75 — изменить порог\n"
         f"/preferences — мои предпочтения\n"
         f"/last_scores — последние оценки"
     )
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text)
 
 
 # --- Threshold ---
@@ -386,7 +386,7 @@ async def preferences(message: types.Message):
         for p in negative:
             text += f"  {p.feature_type}: {p.feature_value} {p.weight}\n"
 
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text)
 
 
 # --- Last scores ---
@@ -419,7 +419,7 @@ async def last_scores(message: types.Message):
         emoji = {"sent": "📤", "scored": "📊"}.get(status, "❓")
         text += f"{emoji} {p.final_score} @{p.channel.channel_address} — {ct} — {status}\n"
 
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text)
 
 
 # --- Feedback callbacks ---

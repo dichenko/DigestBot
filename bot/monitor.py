@@ -209,6 +209,16 @@ async def _send_post(post: Post, ch: Channel, user: User, score: int) -> None:
             reply_markup=kb,
         )
         logger.info("Sent post %d to user %d (score=%d)", post.id, user.telegram_id, score)
+    except Exception:
+        try:
+            await bot.send_message(
+                user.telegram_id, text,
+                disable_web_page_preview=True,
+                reply_markup=kb,
+            )
+            logger.info("Sent post %d to user %d (score=%d, plain)", post.id, user.telegram_id, score)
+        except Exception:
+            raise
 
         async with async_session() as session:
             p = await session.get(Post, post.id)
