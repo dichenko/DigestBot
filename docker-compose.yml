@@ -1,3 +1,7 @@
+networks:
+  app_net:
+    driver: bridge
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -11,6 +15,8 @@ services:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
+    networks:
+      - app_net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U news_filter_user -d news_filter_bot"]
       interval: 5s
@@ -26,6 +32,8 @@ services:
     volumes:
       - ./data:/app/data
       - ./user_session.session:/app/user_session.session
+    networks:
+      - app_net
     depends_on:
       postgres:
         condition: service_healthy
