@@ -21,6 +21,7 @@ from bot.models import Channel, Digest, Filter, Post, User
 from bot.digest import generate_digest
 from bot.classifier import classify_posts
 from bot.reader import reader
+from bot.utils import send_long_message
 
 logger = logging.getLogger(__name__)
 
@@ -421,7 +422,10 @@ async def manual_digest(message: types.Message):
         await message.answer("Нет полезных постов за этот период.")
         return
 
-    await message.answer(digest.content, parse_mode="Markdown", disable_web_page_preview=True)
+    await send_long_message(
+        message.bot, message.from_user.id, digest.content,
+        parse_mode="Markdown", disable_web_page_preview=True,
+    )
 
     async with async_session() as session:
         d = await session.get(Digest, digest.id)

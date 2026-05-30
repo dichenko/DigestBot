@@ -36,10 +36,11 @@ async def _scheduled_digest_job() -> None:
         digest = await generate_digest(owner_id)
         if digest and digest.content:
             from bot.main import bot
-            await bot.send_message(
-                owner_id, digest.content, parse_mode="Markdown", disable_web_page_preview=True
+            from bot.utils import send_long_message
+            parts = await send_long_message(
+                bot, owner_id, digest.content, parse_mode="Markdown", disable_web_page_preview=True
             )
-            logger.info("Digest sent to owner %d", owner_id)
+            logger.info("Digest sent to owner %d (%d parts)", owner_id, parts)
         else:
             from bot.main import bot
             await bot.send_message(

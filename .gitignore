@@ -11,3 +11,4 @@ __pycache__/
 venv/
 deploy_key
 deploy_key.pub
+query_posts.py
