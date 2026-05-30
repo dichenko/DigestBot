@@ -214,13 +214,12 @@ async def _send_post(post: Post, ch: Channel, user: User, score: int) -> None:
             )
             logger.info("Sent post %d to user %d (score=%d, plain)", post.id, user.telegram_id, score)
         except Exception:
-            raise
+            logger.exception("Failed to send post %d to user %d", post.id, user.telegram_id)
+            return
 
-        async with async_session() as session:
-            p = await session.get(Post, post.id)
-            if p:
-                p.processing_status = "sent"
-                p.sent_at = datetime.datetime.now(datetime.timezone.utc)
-                await session.commit()
-    except Exception:
-        logger.exception("Failed to send post %d to user %d", post.id, user.telegram_id)
+    async with async_session() as session:
+        p = await session.get(Post, post.id)
+        if p:
+            p.processing_status = "sent"
+            p.sent_at = datetime.datetime.now(datetime.timezone.utc)
+            await session.commit()
