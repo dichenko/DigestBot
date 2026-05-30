@@ -170,7 +170,7 @@ async def _process_channel_posts(ch: Channel, user: User) -> int:
 
 
 async def _send_post(post: Post, ch: Channel, user: User, score: int) -> None:
-    from bot.main import bot
+    from bot.bot_instance import bot
 
     features = post.features_json or {}
     summary = features.get("summary", "")
