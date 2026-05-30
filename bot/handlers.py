@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from aiogram import F, Router, types
@@ -93,8 +94,13 @@ async def add_channel_prompt(message: types.Message, state: FSMContext):
         return
     await state.set_state(AddChannelState.waiting_for_link)
     await message.answer(
-        "Отправь ссылку на канал или его username.\n"
-        "Например: https://t.me/durov или @durov",
+        "Отправь ссылки на каналы (можно несколько через запятую, пробел или с новой строки).\n"
+        "Примеры:\n"
+        "• https://t.me/durov\n"
+        "• @durov\n"
+        "• Пачкой: @durov, @somechannel\n"
+        "  https://t.me/channel1\n"
+        "  @channel2\nt.me/channel3",
         reply_markup=types.ReplyKeyboardRemove(),
     )
 
@@ -104,55 +110,98 @@ async def add_channel_receive(message: types.Message, state: FSMContext):
     if not _is_owner(message):
         await message.answer("Доступ запрещён.")
         return
-    raw = message.text.strip()
-    username = raw
-    for prefix in ("https://t.me/", "@", "t.me/"):
-        if raw.lower().startswith(prefix):
-            username = raw[len(prefix):]
-            break
-    username = username.rstrip("/").split("/")[0].split("?")[0]
 
-    try:
-        entity = await reader.client.get_entity(username)
-    except Exception:
+    raw = message.text.strip()
+    usernames = _parse_usernames(raw)
+
+    if not usernames:
         await message.answer(
-            "Не удалось найти канал. Проверь ссылку и убедись, что канал публичный.",
+            "Не нашёл ни одного канала в сообщении. Попробуй ещё раз.",
             reply_markup=main_menu_kb(),
         )
         await state.clear()
         return
 
-    channel_title = getattr(entity, "title", username)
+    added: list[str] = []
+    skipped: list[str] = []
+    failed: list[str] = []
 
-    async with async_session() as session:
-        existing = await session.execute(
-            select(Channel).where(
-                Channel.user_id == message.from_user.id,
-                Channel.channel_username == username,
+    for i, username in enumerate(usernames):
+        if i > 0:
+            await asyncio.sleep(0.5)
+        try:
+            entity = await reader.client.get_entity(username)
+        except Exception:
+            failed.append(username)
+            continue
+
+        channel_title = getattr(entity, "title", username)
+
+        async with async_session() as session:
+            existing = await session.execute(
+                select(Channel).where(
+                    Channel.user_id == message.from_user.id,
+                    Channel.channel_username == username,
+                )
             )
-        )
-        if existing.scalar_one_or_none():
-            await message.answer(
-                f"Канал @{username} уже добавлен.",
-                reply_markup=main_menu_kb(),
+            if existing.scalar_one_or_none():
+                skipped.append(username)
+                continue
+
+            ch = Channel(
+                user_id=message.from_user.id,
+                channel_username=username,
+                channel_title=channel_title,
+                channel_link=f"https://t.me/{username}",
             )
-            await state.clear()
-            return
+            session.add(ch)
+            await session.commit()
 
-        ch = Channel(
-            user_id=message.from_user.id,
-            channel_username=username,
-            channel_title=channel_title,
-            channel_link=f"https://t.me/{username}",
-        )
-        session.add(ch)
-        await session.commit()
+        added.append(f"• {channel_title} (@{username})")
 
-    await message.answer(
-        f"Канал «{channel_title}» (@{username}) добавлен.",
-        reply_markup=main_menu_kb(),
-    )
+    response_parts: list[str] = []
+    if added:
+        response_parts.append(f"✅ Добавлено ({len(added)}):\n" + "\n".join(added))
+    if skipped:
+        response_parts.append(f"⏭️ Уже были ({len(skipped)}): " + ", ".join(f"@{u}" for u in skipped))
+    if failed:
+        response_parts.append(f"❌ Не найдены ({len(failed)}): " + ", ".join(f"@{u}" for u in failed))
+    if not response_parts:
+        response_parts.append("Ничего не изменилось.")
+
+    await message.answer("\n\n".join(response_parts), reply_markup=main_menu_kb())
     await state.clear()
+
+
+def _parse_usernames(text: str) -> list[str]:
+    """Extract unique channel usernames from arbitrary text."""
+    import re
+
+    seen: set[str] = set()
+    result: list[str] = []
+
+    pattern = re.compile(
+        r"(?:https?://)?t\.me/([a-zA-Z][\w]{3,31})"
+        r"|@([a-zA-Z][\w]{3,31})",
+        re.IGNORECASE,
+    )
+
+    for match in pattern.finditer(text):
+        username = (match.group(1) or match.group(2)).lower()
+        if username and username not in seen:
+            seen.add(username)
+            result.append(username)
+
+    # Also try bare usernames (single words that look like channel names)
+    if not result:
+        for word in text.split():
+            word = word.strip("@ ").lower()
+            if re.match(r"^[a-zA-Z][\w]{3,31}$", word):
+                if word not in seen:
+                    seen.add(word)
+                    result.append(word)
+
+    return result
 
 
 # --- My channels ---
