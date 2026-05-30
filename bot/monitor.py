@@ -4,6 +4,7 @@ import asyncio
 import datetime
 import hashlib
 import logging
+from datetime import timezone, timedelta
 
 from sqlalchemy import select, desc
 
@@ -86,7 +87,8 @@ async def _fetch_new_posts(ch: Channel, user: User) -> int:
     if since_id is None:
         since_id = 0
 
-    raw_posts = await reader.fetch_posts(ch.channel_address, since=None, limit=config.max_posts_per_run)
+    since_date = datetime.datetime.now(timezone.utc) - timedelta(days=config.max_post_age_days)
+    raw_posts = await reader.fetch_posts(ch.channel_address, since=since_date, limit=config.max_posts_per_run)
 
     new_count = 0
     max_id = ch.last_seen_message_id or 0

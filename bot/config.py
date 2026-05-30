@@ -34,6 +34,7 @@ class Config:
     max_posts_per_run: int = field(default_factory=lambda: int(_env("MAX_POSTS_PER_CHANNEL_PER_RUN", "20")))
     min_post_length: int = field(default_factory=lambda: int(_env("MIN_POST_LENGTH", "80")))
     enable_debug_scoring: bool = field(default_factory=lambda: _env("ENABLE_DEBUG_SCORING", "true").lower() == "true")
+    max_post_age_days: int = field(default_factory=lambda: int(_env("MAX_POST_AGE_DAYS", "7")))
 
     def validate(self) -> list[str]:
         errors: list[str] = []
