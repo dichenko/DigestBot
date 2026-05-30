@@ -6,6 +6,7 @@ from pathlib import Path
 
 from openai import AsyncOpenAI
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from bot.config import config
 from bot.db import async_session
@@ -32,6 +33,7 @@ async def generate_digest(user_id: int, manual: bool = False) -> Digest | None:
         result = await session.execute(
             select(Post)
             .join(Post.channel)
+            .options(selectinload(Post.channel))
             .where(
                 Channel.user_id == user_id,
                 Post.classification.in_(["normal", "highlight"]),
