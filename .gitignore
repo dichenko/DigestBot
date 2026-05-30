@@ -9,3 +9,5 @@ __pycache__/
 *.session-journal
 .venv/
 venv/
+deploy_key
+deploy_key.pub

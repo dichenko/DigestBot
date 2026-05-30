@@ -1,0 +1,44 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate .env file
+        run: |
+          cat > .env << 'ENVEOF'
+          BOT_TOKEN=${{ secrets.BOT_TOKEN }}
+          TELEGRAM_API_ID=${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH=${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_USER_SESSION=user_session
+          DEEPSEEK_API_KEY=${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_MODEL=deepseek-chat
+          DB_TYPE=sqlite
+          DB_PATH=data/digest_bot.db
+          OWNER_TELEGRAM_ID=${{ secrets.OWNER_TELEGRAM_ID }}
+          TIMEZONE=Europe/Moscow
+          MORNING_DIGEST_TIME=09:00
+          EVENING_DIGEST_TIME=19:00
+          ENVEOF
+
+      - name: Deploy to server
+        uses: easingthemes/ssh-deploy@v5
+        with:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          REMOTE_HOST: ${{ secrets.SSH_HOST }}
+          REMOTE_USER: ${{ secrets.SSH_USER }}
+          TARGET: /opt/digest_bot
+          EXCLUDE: "data/*.db,*.session,*.session-journal,.git,.github,.gitignore,.env.example,setup.bat,setup_session.py,deploy.sh,deploy_key,deploy_key.pub"
+          SCRIPT_AFTER: |
+            cd /opt/digest_bot
+            docker compose down --remove-orphans
+            docker compose up -d --build
+            docker image prune -f
+            docker compose ps
