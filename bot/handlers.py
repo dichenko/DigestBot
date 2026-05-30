@@ -9,38 +9,87 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     InlineKeyboardButton,
+    InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select
+from sqlalchemy import select, desc
 
 from bot.config import config
 from bot.db import async_session
-from bot.models import Channel, Digest, Filter, Post, User
-from bot.digest import generate_digest
-from bot.classifier import classify_posts
+from bot.models import Channel, Post, User, UserFeedback, UserPreference
 from bot.reader import reader
-from bot.utils import send_long_message
 
 logger = logging.getLogger(__name__)
 
 router = Router()
 
 
-def _is_owner(message: types.Message | types.CallbackQuery) -> bool:
-    u = message.from_user
+FEEDBACK_WEIGHTS = {
+    "more_like_this": 1,
+    "less_like_this": -1,
+    "very_important": 3,
+    "hide_similar": -3,
+}
+
+FEEDBACK_LABELS = {
+    "m": "more_like_this",
+    "l": "less_like_this",
+    "v": "very_important",
+    "h": "hide_similar",
+}
+
+FEEDBACK_CONFIRM = {
+    "more_like_this": "Учту: буду чаще показывать похожее.",
+    "less_like_this": "Учту: буду реже показывать похожее.",
+    "very_important": "Отмечено как очень важное.",
+    "hide_similar": "Учту: похожее буду скрывать.",
+}
+
+CHANNEL_FEEDBACK_DELTAS = {
+    "more_like_this": 1,
+    "less_like_this": -1,
+    "very_important": 2,
+    "hide_similar": -2,
+}
+
+
+def _is_owner(msg: types.Message | types.CallbackQuery) -> bool:
+    u = msg.from_user
     return u is not None and u.id == config.owner_id
 
 
-async def _ensure_user(user_id: int) -> None:
+def _ensure_owner(msg: types.Message | types.CallbackQuery) -> bool:
+    if not _is_owner(msg):
+        if isinstance(msg, types.Message):
+            asyncio.ensure_future(msg.answer("Доступ запрещён."))
+        else:
+            asyncio.ensure_future(msg.answer("Доступ запрещён."))
+        return False
+    return True
+
+
+async def _ensure_user(telegram_id: int) -> User:
     async with async_session() as session:
-        existing = await session.execute(
-            select(User).where(User.telegram_id == user_id)
-        )
-        if not existing.scalar_one_or_none():
-            session.add(User(telegram_id=user_id))
+        result = await session.execute(select(User).where(User.telegram_id == telegram_id))
+        u = result.scalar_one_or_none()
+        if not u:
+            u = User(telegram_id=telegram_id)
+            session.add(u)
             await session.commit()
+            await session.refresh(u)
+        return u
+
+
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📋 Мои каналы"), KeyboardButton(text="➕ Добавить канал")],
+            [KeyboardButton(text="📊 Статус"), KeyboardButton(text="⚙️ Настройки")],
+        ],
+        resize_keyboard=True,
+    )
 
 
 # --- States ---
@@ -49,83 +98,79 @@ class AddChannelState(StatesGroup):
     waiting_for_link = State()
 
 
-class AddFilterState(StatesGroup):
-    waiting_for_value = State()
-
-
-# --- Main menu ---
-
-def main_menu_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📬 Сгенерировать дайджест")],
-            [KeyboardButton(text="📋 Мои каналы"), KeyboardButton(text="➕ Добавить канал")],
-            [KeyboardButton(text="🔧 Фильтры"), KeyboardButton(text="⚙️ Настройки")],
-        ],
-        resize_keyboard=True,
-    )
-
-
 # --- /start ---
 
 @router.message(Command("start"))
 async def cmd_start(message: types.Message):
-    if not _is_owner(message):
-        await message.answer("Доступ запрещён.")
+    if not _ensure_owner(message):
         return
     await _ensure_user(message.from_user.id)
     await message.answer(
-        "Привет! Я бот для создания дайджестов из Telegram-каналов.\n\n"
-        "Что умею:\n"
-        "• Собираю посты из выбранных каналов\n"
-        "• Фильтрую шум и рекламу\n"
-        "• Выделяю важное\n"
-        "• Присылаю дайджест утром и вечером\n\n"
-        "Используй кнопки внизу, чтобы управлять.",
+        "Привет! Я мониторю Telegram-каналы и присылаю только полезные посты.\n\n"
+        "Управление:\n"
+        "/channels — список каналов\n"
+        "/add_channel — добавить канал\n"
+        "/status — статистика\n"
+        "/preferences — мои предпочтения\n"
+        "/last_scores — последние оценки\n"
+        "/threshold 75 — изменить порог\n"
+        "/settings — настройки",
         reply_markup=main_menu_kb(),
     )
 
 
 # --- Add channel ---
 
+def _parse_usernames(text: str) -> list[str]:
+    import re
+    seen: set[str] = set()
+    result: list[str] = []
+    pattern = re.compile(r"(?:https?://)?t\.me/([a-zA-Z][\w]{3,31})|@([a-zA-Z][\w]{3,31})", re.IGNORECASE)
+    for match in pattern.finditer(text):
+        username = (match.group(1) or match.group(2)).lower()
+        if username and username not in seen:
+            seen.add(username)
+            result.append(username)
+    if not result:
+        for word in text.split():
+            word = word.strip("@ ").lower()
+            if re.match(r"^[a-zA-Z][\w]{3,31}$", word):
+                if word not in seen:
+                    seen.add(word)
+                    result.append(word)
+    return result
+
+
 @router.message(F.text == "➕ Добавить канал")
+@router.message(Command("add_channel"))
 async def add_channel_prompt(message: types.Message, state: FSMContext):
-    if not _is_owner(message):
-        await message.answer("Доступ запрещён.")
+    if not _ensure_owner(message):
         return
     await state.set_state(AddChannelState.waiting_for_link)
     await message.answer(
         "Отправь ссылки на каналы (можно несколько через запятую, пробел или с новой строки).\n"
         "Примеры:\n"
-        "• https://t.me/durov\n"
         "• @durov\n"
-        "• Пачкой: @durov, @somechannel\n"
-        "  https://t.me/channel1\n"
-        "  @channel2\nt.me/channel3",
+        "• https://t.me/durov\n"
+        "• Пачкой: @ch1, @ch2, t.me/ch3",
         reply_markup=types.ReplyKeyboardRemove(),
     )
 
 
 @router.message(AddChannelState.waiting_for_link)
 async def add_channel_receive(message: types.Message, state: FSMContext):
-    if not _is_owner(message):
-        await message.answer("Доступ запрещён.")
+    if not _ensure_owner(message):
         return
-
+    user = await _ensure_user(message.from_user.id)
     raw = message.text.strip()
     usernames = _parse_usernames(raw)
 
     if not usernames:
-        await message.answer(
-            "Не нашёл ни одного канала в сообщении. Попробуй ещё раз.",
-            reply_markup=main_menu_kb(),
-        )
+        await message.answer("Не нашёл каналов. Попробуй ещё раз.", reply_markup=main_menu_kb())
         await state.clear()
         return
 
-    added: list[str] = []
-    skipped: list[str] = []
-    failed: list[str] = []
+    added, skipped, failed = [], [], []
 
     for i, username in enumerate(usernames):
         if i > 0:
@@ -136,13 +181,14 @@ async def add_channel_receive(message: types.Message, state: FSMContext):
             failed.append(username)
             continue
 
-        channel_title = getattr(entity, "title", username)
+        title = getattr(entity, "title", username)
+        addr = username
 
         async with async_session() as session:
             existing = await session.execute(
                 select(Channel).where(
-                    Channel.user_id == message.from_user.id,
-                    Channel.channel_username == username,
+                    Channel.user_id == user.id,
+                    Channel.channel_address == addr,
                 )
             )
             if existing.scalar_one_or_none():
@@ -150,311 +196,328 @@ async def add_channel_receive(message: types.Message, state: FSMContext):
                 continue
 
             ch = Channel(
-                user_id=message.from_user.id,
+                user_id=user.id,
                 channel_username=username,
-                channel_title=channel_title,
+                channel_title=title,
                 channel_link=f"https://t.me/{username}",
+                channel_address=addr,
             )
             session.add(ch)
             await session.commit()
 
-        added.append(f"• {channel_title} (@{username})")
+            # Seed last_seen_message_id to avoid old history
+            try:
+                latest = await reader.client.get_messages(entity, limit=1)
+                if latest and latest[0]:
+                    ch.last_seen_message_id = latest[0].id
+                    await session.commit()
+            except Exception:
+                pass
 
-    response_parts: list[str] = []
+        added.append(f"• {title} (@{username})")
+
+    parts = []
     if added:
-        response_parts.append(f"✅ Добавлено ({len(added)}):\n" + "\n".join(added))
+        parts.append(f"✅ Добавлено ({len(added)}):\n" + "\n".join(added))
     if skipped:
-        response_parts.append(f"⏭️ Уже были ({len(skipped)}): " + ", ".join(f"@{u}" for u in skipped))
+        parts.append(f"⏭️ Уже были ({len(skipped)}): " + ", ".join(f"@{u}" for u in skipped))
     if failed:
-        response_parts.append(f"❌ Не найдены ({len(failed)}): " + ", ".join(f"@{u}" for u in failed))
-    if not response_parts:
-        response_parts.append("Ничего не изменилось.")
+        parts.append(f"❌ Не найдены ({len(failed)}): " + ", ".join(f"@{u}" for u in failed))
+    if not parts:
+        parts.append("Ничего не изменилось.")
 
-    await message.answer("\n\n".join(response_parts), reply_markup=main_menu_kb())
+    await message.answer("\n\n".join(parts), reply_markup=main_menu_kb())
     await state.clear()
 
 
-def _parse_usernames(text: str) -> list[str]:
-    """Extract unique channel usernames from arbitrary text."""
-    import re
-
-    seen: set[str] = set()
-    result: list[str] = []
-
-    pattern = re.compile(
-        r"(?:https?://)?t\.me/([a-zA-Z][\w]{3,31})"
-        r"|@([a-zA-Z][\w]{3,31})",
-        re.IGNORECASE,
-    )
-
-    for match in pattern.finditer(text):
-        username = (match.group(1) or match.group(2)).lower()
-        if username and username not in seen:
-            seen.add(username)
-            result.append(username)
-
-    # Also try bare usernames (single words that look like channel names)
-    if not result:
-        for word in text.split():
-            word = word.strip("@ ").lower()
-            if re.match(r"^[a-zA-Z][\w]{3,31}$", word):
-                if word not in seen:
-                    seen.add(word)
-                    result.append(word)
-
-    return result
-
-
-# --- My channels ---
+# --- Channels list ---
 
 @router.message(F.text == "📋 Мои каналы")
-async def my_channels(message: types.Message):
-    if not _is_owner(message):
-        await message.answer("Доступ запрещён.")
+@router.message(Command("channels"))
+async def channels_list(message: types.Message):
+    if not _ensure_owner(message):
         return
+    user = await _ensure_user(message.from_user.id)
+
     async with async_session() as session:
         result = await session.execute(
-            select(Channel).where(Channel.user_id == message.from_user.id)
+            select(Channel).where(Channel.user_id == user.id)
         )
         channels = result.scalars().all()
 
     if not channels:
-        await message.answer("У тебя пока нет добавленных каналов.")
+        await message.answer("Нет каналов. Добавь через /add_channel.")
         return
 
-    kb = await _build_channels_keyboard(message.from_user.id)
-    await message.answer(
-        "Твои каналы. Нажми на канал, чтобы включить/выключить, ❌ чтобы удалить.",
-        reply_markup=kb.as_markup(),
-    )
-
-
-async def _build_channels_keyboard(user_id: int) -> InlineKeyboardBuilder:
-    async with async_session() as session:
-        result = await session.execute(
-            select(Channel).where(Channel.user_id == user_id)
-        )
-        channels = result.scalars().all()
     kb = InlineKeyboardBuilder()
     for ch in channels:
         status = "✅" if ch.is_active else "⏸️"
         kb.row(
             InlineKeyboardButton(
-                text=f"{status} {ch.channel_title or ch.channel_username}",
-                callback_data=f"ch_toggle:{ch.id}",
+                text=f"{status} {ch.channel_title or ch.channel_address} (q={ch.channel_quality_weight})",
+                callback_data=f"ch_rm:{ch.id}",
             ),
-            InlineKeyboardButton(text="❌", callback_data=f"ch_delete:{ch.id}"),
         )
-    return kb
+
+    await message.answer("Твои каналы. Нажми чтобы удалить.", reply_markup=kb.as_markup())
 
 
-@router.callback_query(F.data.startswith("ch_toggle:"))
-async def toggle_channel(callback: types.CallbackQuery):
-    if not _is_owner(callback):
-        await callback.answer("Доступ запрещён.")
+@router.callback_query(F.data.startswith("ch_rm:"))
+async def remove_channel(callback: types.CallbackQuery):
+    if not _ensure_owner(callback):
         return
     ch_id = int(callback.data.split(":")[1])
     async with async_session() as session:
         ch = await session.get(Channel, ch_id)
-        if ch and ch.user_id == callback.from_user.id:
-            ch.is_active = not ch.is_active
-            await session.commit()
-            status = "включён" if ch.is_active else "приостановлен"
-            await callback.answer(f"Канал {status}.")
-        else:
-            await callback.answer("Канал не найден.")
-
-    kb = await _build_channels_keyboard(callback.from_user.id)
-    await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
-
-
-@router.callback_query(F.data.startswith("ch_delete:"))
-async def delete_channel(callback: types.CallbackQuery):
-    if not _is_owner(callback):
-        await callback.answer("Доступ запрещён.")
-        return
-    ch_id = int(callback.data.split(":")[1])
-    async with async_session() as session:
-        ch = await session.get(Channel, ch_id)
-        if ch and ch.user_id == callback.from_user.id:
+        if ch and ch.user_id == (await _ensure_user(callback.from_user.id)).id:
             await session.delete(ch)
             await session.commit()
             await callback.answer("Канал удалён.")
+            await callback.message.edit_text("Канал удалён.")
         else:
-            await callback.answer("Канал не найден.")
-
-    kb = await _build_channels_keyboard(callback.from_user.id)
-    try:
-        await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
-    except Exception:
-        await callback.message.edit_text("У тебя пока нет добавленных каналов.")
+            await callback.answer("Не найден.")
 
 
-# --- Filters ---
+# --- Status ---
 
-@router.message(F.text == "🔧 Фильтры")
-async def filters_menu(message: types.Message):
-    if not _is_owner(message):
-        await message.answer("Доступ запрещён.")
+@router.message(F.text == "📊 Статус")
+@router.message(Command("status"))
+async def status(message: types.Message):
+    if not _ensure_owner(message):
         return
+    user = await _ensure_user(message.from_user.id)
+
     async with async_session() as session:
-        result = await session.execute(
-            select(Filter).where(Filter.user_id == message.from_user.id)
-        )
-        filters = result.scalars().all()
+        total_posts = (await session.execute(select(Post).join(Post.channel).where(Channel.user_id == user.id))).scalars().all()
+        sent = [p for p in total_posts if p.processing_status == "sent"]
+        skipped = [p for p in total_posts if p.processing_status == "skipped_hard_filter"]
+        failed = [p for p in total_posts if p.processing_status == "failed"]
+        channels_result = await session.execute(select(Channel).where(Channel.user_id == user.id))
+        channels = channels_result.scalars().all()
 
-    ignore_list = [f for f in filters if f.type == "ignore"]
-    highlight_list = [f for f in filters if f.type == "highlight"]
-
-    text = "🔧 **Фильтры**\n\n"
-    text += "🚫 **Игнорируемые темы:**\n"
-    text += "\n".join(f"• {f.value}" for f in ignore_list) if ignore_list else "  (пусто)"
-    text += "\n\n⭐ **Важные темы:**\n"
-    text += "\n".join(f"• {f.value}" for f in highlight_list) if highlight_list else "  (пусто)"
-
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text="➕ Добавить игнор-тему", callback_data="f_add:ignore"),
-        InlineKeyboardButton(text="➕ Добавить хайлайт-тему", callback_data="f_add:highlight"),
+    text = (
+        f"📊 **Статус**\n\n"
+        f"Каналов: {len(channels)}\n"
+        f"Постов собрано: {len(total_posts)}\n"
+        f"Отправлено: {len(sent)}\n"
+        f"Пропущено (фильтр): {len(skipped)}\n"
+        f"Ошибок: {len(failed)}\n"
+        f"Порог: {user.score_threshold}/100\n"
     )
-    kb.row(
-        InlineKeyboardButton(text="🗑 Удалить тему", callback_data="f_delete_menu"),
-    )
-
-    await message.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
-
-
-@router.callback_query(F.data.startswith("f_add:"))
-async def filter_add_prompt(callback: types.CallbackQuery, state: FSMContext):
-    if not _is_owner(callback):
-        await callback.answer("Доступ запрещён.")
-        return
-    ftype = callback.data.split(":")[1]
-    await state.update_data(filter_type=ftype)
-    await state.set_state(AddFilterState.waiting_for_value)
-    label = "игнорируемую" if ftype == "ignore" else "важную"
-    await callback.message.answer(f"Отправь {label} тему (одно слово или фразу):")
-    await callback.answer()
-
-
-@router.message(AddFilterState.waiting_for_value)
-async def filter_add_receive(message: types.Message, state: FSMContext):
-    if not _is_owner(message):
-        await message.answer("Доступ запрещён.")
-        return
-    data = await state.get_data()
-    ftype = data.get("filter_type", "ignore")
-    value = message.text.strip()
-
-    async with async_session() as session:
-        f = Filter(user_id=message.from_user.id, type=ftype, value=value)
-        session.add(f)
-        await session.commit()
-
-    await message.answer(f"Тема «{value}» добавлена в {'игнор' if ftype == 'ignore' else 'хайлайты'}.")
-    await state.clear()
-
-
-@router.callback_query(F.data == "f_delete_menu")
-async def filter_delete_menu(callback: types.CallbackQuery):
-    if not _is_owner(callback):
-        await callback.answer("Доступ запрещён.")
-        return
-    async with async_session() as session:
-        result = await session.execute(
-            select(Filter).where(Filter.user_id == callback.from_user.id)
-        )
-        filters = result.scalars().all()
-
-    if not filters:
-        await callback.answer("Нет тем для удаления.")
-        return
-
-    kb = InlineKeyboardBuilder()
-    for f in filters:
-        prefix = "🚫" if f.type == "ignore" else "⭐"
-        kb.row(
-            InlineKeyboardButton(
-                text=f"{prefix} {f.value}",
-                callback_data=f"f_del:{f.id}",
-            )
-        )
-
-    await callback.message.answer("Выбери тему для удаления:", reply_markup=kb.as_markup())
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("f_del:"))
-async def filter_delete(callback: types.CallbackQuery):
-    if not _is_owner(callback):
-        await callback.answer("Доступ запрещён.")
-        return
-    f_id = int(callback.data.split(":")[1])
-    async with async_session() as session:
-        f = await session.get(Filter, f_id)
-        if f and f.user_id == callback.from_user.id:
-            await session.delete(f)
-            await session.commit()
-            await callback.answer("Тема удалена.")
-        else:
-            await callback.answer("Тема не найдена.")
-
-    await callback.message.edit_reply_markup(reply_markup=callback.message.reply_markup)
-
-
-# --- Manual digest ---
-
-@router.message(F.text == "📬 Сгенерировать дайджест")
-async def manual_digest(message: types.Message):
-    if not _is_owner(message):
-        await message.answer("Доступ запрещён.")
-        return
-    await message.answer("Собираю посты из каналов...")
-
-    collected = await reader.collect_posts_for_user(message.from_user.id)
-    await message.answer(f"Собрано новых постов: {collected}\nКлассифицирую...")
-
-    await classify_posts(message.from_user.id)
-
-    digest = await generate_digest(message.from_user.id, manual=True)
-
-    if digest is None or not digest.content:
-        await message.answer("Нет полезных постов за этот период.")
-        return
-
-    await send_long_message(
-        message.bot, message.from_user.id, digest.content,
-        parse_mode="Markdown", disable_web_page_preview=True,
-    )
-
-    async with async_session() as session:
-        d = await session.get(Digest, digest.id)
-        if d:
-            d.sent_at = d.sent_at or d.created_at
-            await session.commit()
+    await message.answer(text, parse_mode="Markdown")
 
 
 # --- Settings ---
 
 @router.message(F.text == "⚙️ Настройки")
+@router.message(Command("settings"))
 async def settings(message: types.Message):
-    if not _is_owner(message):
-        await message.answer("Доступ запрещён.")
+    if not _ensure_owner(message):
         return
-    async with async_session() as session:
-        user = await session.execute(
-            select(User).where(User.telegram_id == message.from_user.id)
-        )
-        u = user.scalar_one_or_none()
-
-    if not u:
-        await message.answer("Пользователь не найден.")
-        return
-
+    user = await _ensure_user(message.from_user.id)
     text = (
-        "⚙️ **Настройки**\n\n"
-        f"Часовой пояс: {u.timezone}\n"
-        f"Утренний дайджест: {u.morning_digest_time}\n"
-        f"Вечерний дайджест: {u.evening_digest_time}\n"
+        f"⚙️ **Настройки**\n\n"
+        f"Порог отправки: {user.score_threshold}/100\n"
+        f"Часовой пояс: {user.timezone}\n\n"
+        f"/threshold 75 — изменить порог\n"
+        f"/preferences — мои предпочтения\n"
+        f"/last_scores — последние оценки"
     )
     await message.answer(text, parse_mode="Markdown")
+
+
+# --- Threshold ---
+
+@router.message(Command("threshold"))
+async def threshold(message: types.Message):
+    if not _ensure_owner(message):
+        return
+    user = await _ensure_user(message.from_user.id)
+
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        await message.answer(f"Текущий порог: {user.score_threshold}/100\nИспользуй: /threshold 75")
+        return
+
+    try:
+        new_threshold = int(parts[1])
+        new_threshold = max(0, min(100, new_threshold))
+    except ValueError:
+        await message.answer("Укажи число: /threshold 75")
+        return
+
+    async with async_session() as session:
+        u = await session.get(User, user.id)
+        if u:
+            u.score_threshold = new_threshold
+            await session.commit()
+
+    await message.answer(f"Порог изменён: {new_threshold}/100")
+
+
+# --- Preferences ---
+
+@router.message(Command("preferences"))
+async def preferences(message: types.Message):
+    if not _ensure_owner(message):
+        return
+    user = await _ensure_user(message.from_user.id)
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(UserPreference).where(UserPreference.user_id == user.id).order_by(desc(UserPreference.weight))
+        )
+        prefs = result.scalars().all()
+
+    if not prefs:
+        await message.answer("Нет накопленных предпочтений.")
+        return
+
+    positive = [p for p in prefs if p.weight > 0][:10]
+    negative = [p for p in prefs if p.weight < 0][-10:]
+
+    text = "🧠 **Предпочтения**\n\n"
+    if positive:
+        text += "*Топ позитивных:*\n"
+        for p in positive:
+            text += f"  {p.feature_type}: {p.feature_value} +{p.weight}\n"
+    if negative:
+        text += "\n*Топ негативных:*\n"
+        for p in negative:
+            text += f"  {p.feature_type}: {p.feature_value} {p.weight}\n"
+
+    await message.answer(text, parse_mode="Markdown")
+
+
+# --- Last scores ---
+
+@router.message(Command("last_scores"))
+async def last_scores(message: types.Message):
+    if not _ensure_owner(message):
+        return
+    user = await _ensure_user(message.from_user.id)
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(Post)
+            .join(Post.channel)
+            .where(Channel.user_id == user.id, Post.final_score.isnot(None))
+            .order_by(desc(Post.updated_at))
+            .limit(10)
+        )
+        posts = result.scalars().all()
+
+    if not posts:
+        await message.answer("Нет оценённых постов.")
+        return
+
+    text = "📊 **Последние оценки**\n\n"
+    for p in posts:
+        features = p.features_json or {}
+        ct = features.get("content_type", "?")
+        status = p.processing_status
+        emoji = {"sent": "📤", "scored": "📊"}.get(status, "❓")
+        text += f"{emoji} {p.final_score} @{p.channel.channel_address} — {ct} — {status}\n"
+
+    await message.answer(text, parse_mode="Markdown")
+
+
+# --- Feedback callbacks ---
+
+@router.callback_query(F.data.startswith("f:"))
+async def feedback_callback(callback: types.CallbackQuery):
+    if not _ensure_owner(callback):
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Ошибка данных.")
+        return
+
+    short_code = parts[1]
+    post_id = int(parts[2])
+    feedback_type = FEEDBACK_LABELS.get(short_code)
+
+    if not feedback_type:
+        await callback.answer("Неизвестный тип.")
+        return
+
+    user = await _ensure_user(callback.from_user.id)
+    weight = FEEDBACK_WEIGHTS[feedback_type]
+
+    async with async_session() as session:
+        post = await session.get(Post, post_id)
+        if not post:
+            await callback.answer("Пост не найден.")
+            return
+
+        existing = await session.execute(
+            select(UserFeedback).where(
+                UserFeedback.user_id == user.id,
+                UserFeedback.post_id == post_id,
+            )
+        )
+        fb = existing.scalar_one_or_none()
+
+        if fb:
+            fb.feedback_type = feedback_type
+            fb.weight = weight
+            fb.created_at = fb.created_at  # keep original
+        else:
+            session.add(UserFeedback(
+                user_id=user.id,
+                post_id=post_id,
+                feedback_type=feedback_type,
+                weight=weight,
+            ))
+
+        # Update preferences
+        features = post.features_json or {}
+        channel_addr = features.get("channel_address", "") or post.channel.channel_address
+
+        await _update_preference(session, user.id, "channel_address", channel_addr, CHANNEL_FEEDBACK_DELTAS[feedback_type])
+
+        for topic in features.get("topics", []):
+            await _update_preference(session, user.id, "topic", topic.lower(), weight)
+        for entity in features.get("entities", []):
+            await _update_preference(session, user.id, "entity", entity.lower(), weight)
+
+        ct = (features.get("content_type") or "").lower()
+        if ct:
+            await _update_preference(session, user.id, "content_type", ct, weight)
+
+        tone = (features.get("tone") or "").lower()
+        if tone:
+            await _update_preference(session, user.id, "tone", tone, weight)
+
+        # Update channel quality weight for strong signals
+        if feedback_type in ("very_important", "hide_similar"):
+            ch = await session.get(Channel, post.channel_id)
+            if ch:
+                delta = 1 if feedback_type == "very_important" else -1
+                ch.channel_quality_weight = max(-15, min(15, ch.channel_quality_weight + delta))
+
+        await session.commit()
+
+    await callback.answer(FEEDBACK_CONFIRM[feedback_type])
+
+
+async def _update_preference(session, user_id: int, ftype: str, fvalue: str, delta: int) -> None:
+    result = await session.execute(
+        select(UserPreference).where(
+            UserPreference.user_id == user_id,
+            UserPreference.feature_type == ftype,
+            UserPreference.feature_value == fvalue,
+        )
+    )
+    pref = result.scalar_one_or_none()
+
+    if pref:
+        pref.weight = max(-30, min(30, pref.weight + delta))
+    else:
+        session.add(UserPreference(
+            user_id=user_id,
+            feature_type=ftype,
+            feature_value=fvalue,
+            weight=max(-30, min(30, delta)),
+        ))

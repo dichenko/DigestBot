@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -20,35 +19,21 @@ class Config:
 
     api_id: int = field(default_factory=lambda: int(_env("TELEGRAM_API_ID") or 0))
     api_hash: str = field(default_factory=lambda: _env("TELEGRAM_API_HASH"))
-    session_name: str = field(
-        default_factory=lambda: _env("TELEGRAM_USER_SESSION", "user_session")
-    )
+    session_name: str = field(default_factory=lambda: _env("TELEGRAM_USER_SESSION", "user_session"))
 
+    database_url: str = field(default_factory=lambda: _env("DATABASE_URL"))
+    postgres_password: str = field(default_factory=lambda: _env("POSTGRES_PASSWORD", ""))
+
+    llm_provider: str = field(default_factory=lambda: _env("LLM_PROVIDER", "deepseek"))
     deepseek_key: str = field(default_factory=lambda: _env("DEEPSEEK_API_KEY"))
     deepseek_model: str = field(default_factory=lambda: _env("DEEPSEEK_MODEL", "deepseek-chat"))
 
-    db_type: str = field(default_factory=lambda: _env("DB_TYPE", "sqlite"))
-    db_path: str = field(default_factory=lambda: _env("DB_PATH", "data/digest_bot.db"))
-    db_host: str = field(default_factory=lambda: _env("DB_HOST", "localhost"))
-    db_port: int = field(default_factory=lambda: int(_env("DB_PORT") or 5432))
-    db_username: str = field(default_factory=lambda: _env("DB_USERNAME", ""))
-    db_password: str = field(default_factory=lambda: _env("DB_PASSWORD", ""))
-    db_name: str = field(default_factory=lambda: _env("DB_NAME", "digest_bot"))
-
+    monitor_interval_minutes: int = field(default_factory=lambda: int(_env("MONITOR_INTERVAL_MINUTES", "5")))
+    default_score_threshold: int = field(default_factory=lambda: int(_env("DEFAULT_SCORE_THRESHOLD", "70")))
     timezone: str = field(default_factory=lambda: _env("TIMEZONE", "Europe/Moscow"))
-    morning_time: str = field(default_factory=lambda: _env("MORNING_DIGEST_TIME", "09:00"))
-    evening_time: str = field(default_factory=lambda: _env("EVENING_DIGEST_TIME", "19:00"))
-
-    @property
-    def database_url(self) -> str:
-        if self.db_type == "postgresql":
-            return (
-                f"postgresql+asyncpg://{self.db_username}:{self.db_password}"
-                f"@{self.db_host}:{self.db_port}/{self.db_name}"
-            )
-        path = Path(self.db_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return f"sqlite+aiosqlite:///{path.resolve()}"
+    max_posts_per_run: int = field(default_factory=lambda: int(_env("MAX_POSTS_PER_CHANNEL_PER_RUN", "20")))
+    min_post_length: int = field(default_factory=lambda: int(_env("MIN_POST_LENGTH", "80")))
+    enable_debug_scoring: bool = field(default_factory=lambda: _env("ENABLE_DEBUG_SCORING", "true").lower() == "true")
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -62,6 +47,8 @@ class Config:
             errors.append("OWNER_TELEGRAM_ID is not set")
         if not self.deepseek_key:
             errors.append("DEEPSEEK_API_KEY is not set")
+        if not self.database_url:
+            errors.append("DATABASE_URL is not set")
         return errors
 
 

@@ -1,4 +1,22 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: news-filter-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: news_filter_bot
+      POSTGRES_USER: news_filter_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U news_filter_user -d news_filter_bot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   bot:
     build: .
     container_name: digest_bot
@@ -8,3 +26,9 @@ services:
     volumes:
       - ./data:/app/data
       - ./user_session.session:/app/user_session.session
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

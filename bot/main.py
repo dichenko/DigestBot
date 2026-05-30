@@ -9,11 +9,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from bot.config import config
-from bot.db import async_session, engine
+from bot.db import engine
 from bot.handlers import router
 from bot.models import Base
 from bot.reader import reader
-from bot.scheduler import start_scheduler
+from bot.monitor import monitor_loop
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,8 +41,9 @@ async def on_startup() -> None:
         await conn.run_sync(Base.metadata.create_all)
 
     await reader.start()
-    start_scheduler()
-    logger.info("Bot started")
+    asyncio.create_task(monitor_loop())
+
+    logger.info("Bot started (monitor interval=%d min)", config.monitor_interval_minutes)
 
 
 async def on_shutdown() -> None:
