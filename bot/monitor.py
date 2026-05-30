@@ -174,20 +174,12 @@ async def _send_post(post: Post, ch: Channel, user: User, score: int) -> None:
 
     features = post.features_json or {}
     summary = features.get("summary", "")
-    reasoning = features.get("reasoning", "")
-    channel_addr = features.get("channel_address", ch.channel_address)
+    channel_title = ch.channel_title or ch.channel_username or ch.channel_address
     source_url = post.source_url or f"https://t.me/{ch.channel_address}/{post.telegram_message_id}"
 
-    text = (
-        f"🔥 *Полезная новость*\n\n"
-        f"*Источник:* @{channel_addr}\n"
-        f"*Оценка:* {score}/100\n"
-    )
+    text = f"*{channel_title}*  [Оригинал]({source_url})  *{score}/100*"
     if summary:
-        text += f"\n*Краткое резюме:*\n{summary}\n"
-    if reasoning:
-        text += f"\n*Почему показал:*\n{reasoning}\n"
-    text += f"\n[Открыть источник]({source_url})"
+        text += f"\n\n{summary}"
 
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
