@@ -133,6 +133,7 @@ async def _fetch_new_posts(ch: Channel, user: User) -> int:
 
 
 async def _process_channel_posts(ch: Channel, user: User) -> int:
+    cutoff = datetime.datetime.now(timezone.utc) - timedelta(days=config.max_post_age_days)
     async with async_session() as session:
         result = await session.execute(
             select(Post)
@@ -140,6 +141,7 @@ async def _process_channel_posts(ch: Channel, user: User) -> int:
                 Post.channel_id == ch.id,
                 Post.processing_status.in_(["new", "feature_extracted", "scored"]),
                 Post.sent_at.is_(None),
+                Post.published_at >= cutoff,
             )
             .order_by(Post.id)
         )
